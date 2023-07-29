@@ -5,7 +5,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    http://www.apache.org/licenses/LICENSE-2.0
+	http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -16,10 +16,9 @@ limitations under the License.
 package create
 
 import (
-	"fmt"
-
 	"github.com/litmuschaos/litmusctl/pkg/apis"
 	"github.com/litmuschaos/litmusctl/pkg/utils"
+	"github.com/manifoldco/promptui"
 
 	"github.com/spf13/cobra"
 )
@@ -42,12 +41,18 @@ var projectCmd = &cobra.Command{
 		utils.PrintError(err)
 
 		if projectName == "" {
-			utils.White_B.Print("\nEnter a project name: ")
-			fmt.Scanln(&projectName)
+			prompt := promptui.Prompt{
+				Label: "Enter a project name",
+			}
+			result, err := prompt.Run()
+			if err != nil {
+				utils.PrintError(err)
+			}
+
+			_, err = apis.CreateProjectRequest(result, credentials)
+			utils.PrintError(err)
 		}
 
-		_, err = apis.CreateProjectRequest(projectName, credentials)
-		utils.PrintError(err)
 	},
 }
 
