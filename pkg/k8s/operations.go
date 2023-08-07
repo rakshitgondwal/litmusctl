@@ -5,7 +5,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    http://www.apache.org/licenses/LICENSE-2.0
+	http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -16,7 +16,6 @@ limitations under the License.
 package k8s
 
 import (
-	"bytes"
 	"context"
 	"flag"
 	"fmt"
@@ -24,10 +23,11 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 
 	"k8s.io/client-go/util/homedir"
+	"k8s.io/client-go/util/retry"
+	"k8s.io/client-go/util/yaml"
 
 	"github.com/litmuschaos/litmusctl/pkg/utils"
 	authorizationv1 "k8s.io/api/authorization/v1"
@@ -281,14 +281,10 @@ type ApplyYamlPrams struct {
 }
 
 func ApplyYaml(params ApplyYamlPrams, kubeconfig string, isLocal bool) (output string, err error) {
-	path := params.YamlPath
+	var path string
 	if !isLocal {
 		path = fmt.Sprintf("%s/%s/%s.yaml", params.Endpoint, params.YamlPath, params.Token)
-		req, err := http.NewRequest("GET", path, nil)
-		if err != nil {
-			return "", err
-		}
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := http.Get(path)
 		if err != nil {
 			return "", err
 		}
@@ -302,35 +298,42 @@ func ApplyYaml(params ApplyYamlPrams, kubeconfig string, isLocal bool) (output s
 			return "", err
 		}
 		path = "chaos-delegate-manifest.yaml"
-	}
-
-	args := []string{"kubectl", "apply", "-f", path}
-	if kubeconfig != "" {
-		args = append(args, []string{"--kubeconfig", kubeconfig}...)
 	} else {
-		args = []string{"kubectl", "apply", "-f", path}
+		path = params.YamlPath
 	}
 
-	cmd := exec.Command(args[0], args[1:]...)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	err = cmd.Run()
-	outStr, errStr := stdout.String(), stderr.String()
-
-	// err, can have exit status 1
+	clientset, err := ClientSet(&kubeconfig)
 	if err != nil {
-		// if we get standard error then, return the same
-		if errStr != "" {
-			return "", fmt.Errorf(errStr)
-		}
-
-		// if not standard error found, return error
+		log.Fatal(err)
 		return "", err
 	}
 
-	// If no error found, return standard output
-	return outStr, nil
+	// Read the YAML manifest from the file
+	manifestBytes, err := ioutil.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+
+	// Parse the YAML manifest
+	manifest, err := yaml.ToUnstructured(manifestBytes)
+	if err != nil {
+		return "", err
+	}
+
+	// Create or update the resource using the Kubernetes client
+	err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		res := clientset.Discovery().RESTClient().Post().
+			Resource(manifest.GetKind()).
+			Namespace(manifest.GetNamespace()).
+			Body(manifest).
+			Do(context.Background())
+		return res.Error()
+	})
+	if err != nil {
+		return "", err
+	}
+
+	return "Resource applied successfully", nil
 }
 
 // GetConfigMap returns config map for a given name and namespace
