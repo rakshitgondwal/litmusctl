@@ -16,6 +16,7 @@ limitations under the License.
 package k8s
 
 import (
+	"bytes"
 	"context"
 	"flag"
 	"fmt"
@@ -23,11 +24,10 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 
 	"k8s.io/client-go/util/homedir"
-	"k8s.io/client-go/util/retry"
-	"k8s.io/client-go/util/yaml"
 
 	"github.com/litmuschaos/litmusctl/pkg/utils"
 	authorizationv1 "k8s.io/api/authorization/v1"
@@ -38,6 +38,20 @@ import (
 	"k8s.io/client-go/discovery"
 	authorizationv1client "k8s.io/client-go/kubernetes/typed/authorization/v1"
 )
+
+type KubeFunctions interface {
+	NsExists(namespace string, kubeconfig *string) (bool, error)
+	CheckSAPermissions(params CheckSAPermissionsParams, kubeconfig *string) (bool, error)
+	ValidNs(mode string, label string, kubeconfig *string) (string, bool)
+	WatchPod(params WatchPodParams, kubeconfig *string)
+	podExists(params podExistsParams, kubeconfig *string) bool
+	SAExists(params SAExistsParams, kubeconfig *string) bool
+	ValidSA(namespace string, kubeconfig *string) (string, bool)
+	ApplyYaml(params ApplyYamlPrams, kubeconfig string, isLocal bool) (output string, err error)
+	GetConfigMap(c context.Context, name string, namespace string) (map[string]string, error)
+}
+
+type KubeClientFunctions struct{}
 
 type CanIOptions struct {
 	NoHeaders       bool
@@ -52,7 +66,7 @@ type CanIOptions struct {
 }
 
 // NsExists checks if the given namespace already exists
-func NsExists(namespace string, kubeconfig *string) (bool, error) {
+func (kcf *KubeClientFunctions) NsExists(namespace string, kubeconfig *string) (bool, error) {
 	clientset, err := ClientSet(kubeconfig)
 	if err != nil {
 		return false, err
@@ -76,8 +90,7 @@ type CheckSAPermissionsParams struct {
 	Namespace string
 }
 
-func CheckSAPermissions(params CheckSAPermissionsParams, kubeconfig *string) (bool, error) {
-
+func (kcf *KubeClientFunctions) CheckSAPermissions(params CheckSAPermissionsParams, kubeconfig *string) (bool, error) {
 	var o CanIOptions
 	o.Verb = params.Verb
 	o.Resource.Resource = params.Resource
@@ -127,7 +140,7 @@ func CheckSAPermissions(params CheckSAPermissionsParams, kubeconfig *string) (bo
 }
 
 // ValidNs takes a valid namespace as input from user
-func ValidNs(mode string, label string, kubeconfig *string) (string, bool) {
+func (kcf *KubeClientFunctions) ValidNs(mode string, label string, kubeconfig *string) (string, bool) {
 start:
 	var (
 		namespace string
@@ -149,13 +162,13 @@ start:
 	if namespace == "" {
 		namespace = utils.DefaultNs
 	}
-	ok, err := NsExists(namespace, kubeconfig)
+	ok, err := kcf.NsExists(namespace, kubeconfig)
 	if err != nil {
 		utils.Red.Printf("\n 🚫 Namespace existence check failed: {%s}\n", err.Error())
 		os.Exit(1)
 	}
 	if ok {
-		if podExists(podExistsParams{namespace, label}, kubeconfig) {
+		if kcf.podExists(podExistsParams{namespace, label}, kubeconfig) {
 			utils.Red.Println("\n🚫 There is a Chaos Delegate already present in this namespace. Please enter a different namespace")
 			goto start
 		} else {
@@ -163,7 +176,7 @@ start:
 			utils.White_B.Println("👍 Continuing with", namespace, "namespace")
 		}
 	} else {
-		if val, _ := CheckSAPermissions(CheckSAPermissionsParams{"create", "namespace", false, namespace}, kubeconfig); !val {
+		if val, _ := kcf.CheckSAPermissions(CheckSAPermissionsParams{"create", "namespace", false, namespace}, kubeconfig); !val {
 			utils.Red.Println("🚫 You don't have permissions to create a namespace.\n Please enter an existing namespace.")
 			goto start
 		}
@@ -179,7 +192,7 @@ type WatchPodParams struct {
 }
 
 // WatchPod watches for the pod status
-func WatchPod(params WatchPodParams, kubeconfig *string) {
+func (kcf *KubeClientFunctions) WatchPod(params WatchPodParams, kubeconfig *string) {
 	clientset, err := ClientSet(kubeconfig)
 	if err != nil {
 		log.Fatal(err)
@@ -214,7 +227,7 @@ type podExistsParams struct {
 }
 
 // PodExists checks if the pod with the given label already exists in the given namespace
-func podExists(params podExistsParams, kubeconfig *string) bool {
+func (kcf *KubeClientFunctions) podExists(params podExistsParams, kubeconfig *string) bool {
 	clientset, err := ClientSet(kubeconfig)
 	if err != nil {
 		log.Fatal(err)
@@ -240,7 +253,7 @@ type SAExistsParams struct {
 }
 
 // SAExists checks if the given service account exists in the given namespace
-func SAExists(params SAExistsParams, kubeconfig *string) bool {
+func (kcf *KubeClientFunctions) SAExists(params SAExistsParams, kubeconfig *string) bool {
 	clientset, err := ClientSet(kubeconfig)
 	if err != nil {
 		log.Fatal(err)
@@ -257,14 +270,14 @@ func SAExists(params SAExistsParams, kubeconfig *string) bool {
 }
 
 // ValidSA gets a valid service account as input
-func ValidSA(namespace string, kubeconfig *string) (string, bool) {
+func (kcf *KubeClientFunctions) ValidSA(namespace string, kubeconfig *string) (string, bool) {
 	var sa string
 	utils.White_B.Print("\nEnter service account [Default: ", utils.DefaultSA, "]: ")
 	fmt.Scanln(&sa)
 	if sa == "" {
 		sa = utils.DefaultSA
 	}
-	if SAExists(SAExistsParams{namespace, sa}, kubeconfig) {
+	if kcf.SAExists(SAExistsParams{namespace, sa}, kubeconfig) {
 		utils.White_B.Print("\n👍 Using the existing service account")
 		return sa, true
 	}
@@ -280,11 +293,15 @@ type ApplyYamlPrams struct {
 	YamlPath string
 }
 
-func ApplyYaml(params ApplyYamlPrams, kubeconfig string, isLocal bool) (output string, err error) {
-	var path string
+func (kcf *KubeClientFunctions) ApplyYaml(params ApplyYamlPrams, kubeconfig string, isLocal bool) (output string, err error) {
+	path := params.YamlPath
 	if !isLocal {
 		path = fmt.Sprintf("%s/%s/%s.yaml", params.Endpoint, params.YamlPath, params.Token)
-		resp, err := http.Get(path)
+		req, err := http.NewRequest("GET", path, nil)
+		if err != nil {
+			return "", err
+		}
+		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
 			return "", err
 		}
@@ -298,46 +315,39 @@ func ApplyYaml(params ApplyYamlPrams, kubeconfig string, isLocal bool) (output s
 			return "", err
 		}
 		path = "chaos-delegate-manifest.yaml"
+	}
+
+	args := []string{"kubectl", "apply", "-f", path}
+	if kubeconfig != "" {
+		args = append(args, []string{"--kubeconfig", kubeconfig}...)
 	} else {
-		path = params.YamlPath
+		args = []string{"kubectl", "apply", "-f", path}
 	}
 
-	clientset, err := ClientSet(&kubeconfig)
+	cmd := exec.Command(args[0], args[1:]...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err = cmd.Run()
+	outStr, errStr := stdout.String(), stderr.String()
+
+	// err, can have exit status 1
 	if err != nil {
-		log.Fatal(err)
+		// if we get standard error then, return the same
+		if errStr != "" {
+			return "", fmt.Errorf(errStr)
+		}
+
+		// if not standard error found, return error
 		return "", err
 	}
 
-	// Read the YAML manifest from the file
-	manifestBytes, err := ioutil.ReadFile(path)
-	if err != nil {
-		return "", err
-	}
-
-	// Parse the YAML manifest
-	manifest, err := yaml.ToUnstructured(manifestBytes)
-	if err != nil {
-		return "", err
-	}
-
-	// Create or update the resource using the Kubernetes client
-	err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		res := clientset.Discovery().RESTClient().Post().
-			Resource(manifest.GetKind()).
-			Namespace(manifest.GetNamespace()).
-			Body(manifest).
-			Do(context.Background())
-		return res.Error()
-	})
-	if err != nil {
-		return "", err
-	}
-
-	return "Resource applied successfully", nil
+	// If no error found, return standard output
+	return outStr, nil
 }
 
 // GetConfigMap returns config map for a given name and namespace
-func GetConfigMap(c context.Context, name string, namespace string) (map[string]string, error) {
+func (kcf *KubeClientFunctions) GetConfigMap(c context.Context, name string, namespace string) (map[string]string, error) {
 	var kubeconfig *string
 
 	if home := homedir.HomeDir(); home != "" {
